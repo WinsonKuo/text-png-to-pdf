@@ -13,18 +13,21 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     Image,
     ListFlowable,
     ListItem,
     Paragraph,
-    Preformatted,
     SimpleDocTemplate,
     Spacer,
 )
 
 IMAGE_TAG_PATTERN = re.compile(r"<([^<>]+\.png)>", re.IGNORECASE)
 IMAGE_MARKER_PATTERN = re.compile(r"^\[\[IMAGE:([^\]]+)\]\]$")
+DEFAULT_TEXT_FONT = "Helvetica"
+DEFAULT_CODE_FONT = "Courier"
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +45,13 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         help="Zero or more PNG files.",
+    )
+    parser.add_argument(
+        "--font",
+        help=(
+            "Optional TTF/TTC font path for CJK text. "
+            "If omitted, script tries built-in candidate paths and fails if none is usable."
+        ),
     )
     parser.add_argument("--output", required=True, help="Output PDF path.")
     return parser.parse_args()
@@ -77,18 +87,98 @@ def scale_image(path: Path, max_width: float, max_height: float) -> Image:
     return img
 
 
-def inline_markdown_to_rl_markup(text: str) -> str:
+def inline_markdown_to_rl_markup(text: str, code_font_name: str) -> str:
     escaped = html.escape(text)
-    escaped = re.sub(r"`([^`]+)`", r'<font face="Courier">\1</font>', escaped)
+    escaped = re.sub(r"`([^`]+)`", rf'<font face="{code_font_name}">\1</font>', escaped)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
     escaped = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", escaped)
     escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
     return escaped
 
 
+def resolve_text_fonts(font_path: str | None = None) -> tuple[str, str]:
+    if font_path:
+        custom_font = Path(font_path)
+        if not custom_font.exists():
+            raise FileNotFoundError(f"Font file not found: {custom_font}")
+        ext = custom_font.suffix.lower()
+        if ext not in {".ttf", ".ttc", ".otf"}:
+            raise ValueError(f"Unsupported font format: {custom_font}")
+        try:
+            # TTC collections usually need an explicit subfont index.
+            if ext == ".ttc":
+                font_name = "CustomFontTTC"
+                pdfmetrics.registerFont(TTFont(font_name, str(custom_font), subfontIndex=0))
+            else:
+                font_name = "CustomFontTTF"
+                pdfmetrics.registerFont(TTFont(font_name, str(custom_font)))
+            return font_name, font_name
+        except Exception as exc:
+            raise RuntimeError(f"Failed to register font: {custom_font}") from exc
+
+    candidates = [
+        ("UMingTW", "/usr/share/fonts/truetype/arphic/uming.ttc", 0),
+        ("UKaiTW", "/usr/share/fonts/truetype/arphic/ukai.ttc", 0),
+        ("NotoSansCJKtc", "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf", None),
+        ("NotoSansTC", "/usr/share/fonts/opentype/noto/NotoSansTC-Regular.otf", None),
+        ("NotoSansTC", "/usr/share/fonts/truetype/noto/NotoSansTC-Regular.otf", None),
+    ]
+    for font_name, font_path, subfont_index in candidates:
+        font_file = Path(font_path)
+        if not font_file.exists():
+            continue
+        try:
+            if subfont_index is None:
+                pdfmetrics.registerFont(TTFont(font_name, str(font_file)))
+            else:
+                pdfmetrics.registerFont(TTFont(font_name, str(font_file), subfontIndex=subfont_index))
+            return font_name, font_name
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "No embeddable CJK font found. Provide --font /path/to/font.ttf (or .ttc/.otf), "
+        "or install one of the candidate fonts."
+    )
+
+
+def configure_styles(
+    styles,
+    body_font_name: str,
+    code_font_name: str,
+) -> dict[str, ParagraphStyle | str]:
+    styles["BodyText"].fontName = body_font_name
+    styles["BodyText"].fontSize = 10
+    styles["BodyText"].leading = 13
+    styles["BodyText"].wordWrap = "CJK"
+
+    styles["Heading1"].fontName = body_font_name
+    styles["Heading2"].fontName = body_font_name
+    styles["Heading3"].fontName = body_font_name
+
+    code_style = ParagraphStyle(
+        name="CodeLeft",
+        parent=styles["Code"],
+        fontName=code_font_name,
+        fontSize=9,
+        leading=12,
+        leftIndent=0,
+        rightIndent=0,
+        firstLineIndent=0,
+        wordWrap="CJK",
+    )
+    styles.add(code_style)
+    return {
+        "body": styles["BodyText"],
+        "code": styles["CodeLeft"],
+        "code_font_name": code_font_name,
+    }
+
+
 def build_markdown_flowables(
     text: str,
     styles,
+    style_map: dict[str, ParagraphStyle | str],
     image_map: dict[str, Path],
     appended_images: set[str],
 ) -> List:
@@ -103,7 +193,12 @@ def build_markdown_flowables(
         if paragraph_lines:
             para = " ".join(line.strip() for line in paragraph_lines if line.strip())
             if para:
-                flowables.append(Paragraph(inline_markdown_to_rl_markup(para), styles["BodyText"]))
+                flowables.append(
+                    Paragraph(
+                        inline_markdown_to_rl_markup(para, str(style_map["code_font_name"])),
+                        style_map["body"],
+                    )
+                )
                 flowables.append(Spacer(1, 0.2 * cm))
             paragraph_lines.clear()
 
@@ -111,7 +206,12 @@ def build_markdown_flowables(
         nonlocal bullet_items, ordered_items
         if bullet_items:
             items = [
-                ListItem(Paragraph(inline_markdown_to_rl_markup(item), styles["BodyText"]))
+                ListItem(
+                    Paragraph(
+                        inline_markdown_to_rl_markup(item, str(style_map["code_font_name"])),
+                        style_map["body"],
+                    )
+                )
                 for item in bullet_items
             ]
             flowables.append(ListFlowable(items, bulletType="bullet", bulletColor=colors.black))
@@ -120,7 +220,12 @@ def build_markdown_flowables(
 
         if ordered_items:
             items = [
-                ListItem(Paragraph(inline_markdown_to_rl_markup(item), styles["BodyText"]))
+                ListItem(
+                    Paragraph(
+                        inline_markdown_to_rl_markup(item, str(style_map["code_font_name"])),
+                        style_map["body"],
+                    )
+                )
                 for item in ordered_items
             ]
             flowables.append(ListFlowable(items, bulletType="1", bulletColor=colors.black))
@@ -140,7 +245,7 @@ def build_markdown_flowables(
                 appended_images.add(image_name)
             else:
                 flowables.append(
-                    Paragraph(f"[Missing image: {html.escape(image_name)}]", styles["Code"])
+                    Paragraph(f"[Missing image: {html.escape(image_name)}]", style_map["code"])
                 )
                 flowables.append(Spacer(1, 0.2 * cm))
             continue
@@ -155,10 +260,14 @@ def build_markdown_flowables(
             flush_paragraph()
             flush_lists()
             level = len(heading_match.group(1))
-            content = inline_markdown_to_rl_markup(heading_match.group(2).strip())
+            content = inline_markdown_to_rl_markup(
+                heading_match.group(2).strip(),
+                str(style_map["code_font_name"]),
+            )
             heading_style = ParagraphStyle(
                 name=f"H{level}",
                 parent=styles["Heading1"],
+                fontName=style_map["body"].fontName,
                 fontSize=max(22 - (level * 2), 11),
                 leading=max(26 - (level * 2), 13),
                 spaceAfter=6,
@@ -188,7 +297,7 @@ def build_markdown_flowables(
 
 def build_plain_text_flowables(
     text: str,
-    styles,
+    code_style: ParagraphStyle,
     image_map: dict[str, Path],
     appended_images: set[str],
 ) -> List:
@@ -203,10 +312,13 @@ def build_plain_text_flowables(
                 flowables.append(Spacer(1, 0.3 * cm))
                 appended_images.add(image_name)
             else:
-                flowables.append(Paragraph(f"[Missing image: {html.escape(image_name)}]", styles["Code"]))
+                flowables.append(Paragraph(f"[Missing image: {html.escape(image_name)}]", code_style))
                 flowables.append(Spacer(1, 0.2 * cm))
         else:
-            flowables.append(Preformatted(line, styles["Code"]))
+            if line == "":
+                flowables.append(Spacer(1, 0.15 * cm))
+            else:
+                flowables.append(Paragraph(html.escape(line).replace(" ", "&nbsp;"), code_style))
     flowables.append(Spacer(1, 0.3 * cm))
     return flowables
 
@@ -222,8 +334,8 @@ def main() -> None:
     image_map = normalise_image_map(args.images)
 
     styles = getSampleStyleSheet()
-    body_left = ParagraphStyle(name="BodyLeft", parent=styles["BodyText"], alignment=0)
-    styles.add(body_left)
+    body_font_name, code_font_name = resolve_text_fonts(args.font)
+    style_map = configure_styles(styles, body_font_name, code_font_name)
 
     doc = SimpleDocTemplate(
         args.output,
@@ -243,9 +355,9 @@ def main() -> None:
         content = replace_image_tags(content, seen_refs)
 
         if text_path.suffix.lower() in {".md", ".markdown"}:
-            story.extend(build_markdown_flowables(content, styles, image_map, appended_images))
+            story.extend(build_markdown_flowables(content, styles, style_map, image_map, appended_images))
         else:
-            story.extend(build_plain_text_flowables(content, styles, image_map, appended_images))
+            story.extend(build_plain_text_flowables(content, style_map["code"], image_map, appended_images))
 
         if idx < len(text_paths) - 1:
             story.append(Spacer(1, 0.8 * cm))
